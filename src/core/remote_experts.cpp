@@ -342,7 +342,23 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto w0 = std::chrono::steady_clock::now();
-    if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) return false;
+    // KURAI (2026-10-06): spin on the stream like PeerExperts::finish instead of the blocking sync.  The layer
+    // waits for this helper on the CPU pool's critical path, and on Windows - HIP especially, where the CUDA
+    // branch's cudaInitDevice(ScheduleSpin) does not exist, so the device kept its default policy - a blocking
+    // sync's wake-up costs more than the helper's small batch takes.  STRATA_REMOTE_SPIN=0 keeps the blocking
+    // sync (the same switch the CUDA branch reads).
+    static const bool spin = [] {
+        const char* v = std::getenv("STRATA_REMOTE_SPIN");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    if (spin) {
+        cudaError_t e;
+        while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
+        }
+        if (!check(e, "finish", err, device_)) return false;
+    } else if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) {
+        return false;
+    }
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
     if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
     for (size_t i = 0; i < original_row_.size(); ++i)
