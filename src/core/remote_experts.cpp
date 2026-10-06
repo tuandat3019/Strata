@@ -62,13 +62,24 @@ bool check(cudaError_t result, const char* what, std::string& err, int device) {
 }
 } // namespace
 
+// KURAI (STRATA_PRIMARY_DEVICE, 2026-10-06): see the declaration in remote_experts.hpp.  0 = upstream.
+static int g_primary_device = 0;
+
+void set_primary_device(int ordinal) { g_primary_device = ordinal; }
+int primary_device() { return g_primary_device; }
+
 RemoteExperts::~RemoteExperts() { close(); }
 
 bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     int count = 0;
     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
-    if (device < 1 || device >= count) {
+    if (device < 0 || device >= count) {
         err = "CUDA" + std::to_string(device) + " experts: CUDA device is not visible";
+        return false;
+    }
+    if (device == primary_device()) {   // KURAI: the primary may be any ordinal; the helper cannot be it
+        err = "CUDA" + std::to_string(device) + " experts: the helper cannot be the primary device "
+                                                 "(STRATA_PRIMARY_DEVICE)";
         return false;
     }
     // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
@@ -125,8 +136,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     close();
     int count = 0;
     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
-    if (device < 1 || device >= count || slots <= 0 || ranked.empty() ||
-        layers <= 0 || experts <= 0 || claimed.size() != (size_t) layers * (size_t) experts) {
+    if (device < 0 || device >= count || slots <= 0 || ranked.empty() ||
+        layers <= 0 || experts <= 0 || claimed.size() != (size_t) layers * (size_t) experts ||
+        device == primary_device()) {   // KURAI: the helper cannot be the primary device (any ordinal)
         err = "CUDA" + std::to_string(device) + " experts: need the device, ranked experts and positive slot count";
         return false;
     }

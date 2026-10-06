@@ -89,3 +89,13 @@ private:
 };
 
 } // namespace strata::core
+
+/// KURAI (STRATA_PRIMARY_DEVICE, 2026-10-06): the ordinal the engine's own session runs on.  The Windows
+/// HIP runtime enumerates the cards in an order no HIP_VISIBLE_DEVICES list can change (it only filters),
+/// and the engine used to run on whichever card the runtime numbered 0 - on the RX 6800 + RX 6600 PC that
+/// was the 6600.  The helper expert caches must live on a device other than this one; 0 (the default)
+/// keeps upstream's behavior exactly.  Defined in core/remote_experts.cpp.
+namespace strata::core {
+void set_primary_device(int ordinal);
+int primary_device();
+} // namespace strata::core
