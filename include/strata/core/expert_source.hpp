@@ -226,9 +226,9 @@ private:
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
     // KURAI foresight coverage counters (observe()): the last stored prediction and the running tallies.
-    std::vector<int32_t> pred_ids_;   ///< the prediction stored for pred_layer_ (the last one the thread finished)
+    std::vector<int64_t> pred_ids_;   ///< the prediction stored for pred_layer_ (the last one the thread finished)
     int64_t pred_layer_ = -1;
-    std::atomic<int64_t> cov_calls_{0}, cov_routed_{0}, cov_miss_{0}, cov_pred_total_{0},
+    std::atomic<int64_t> cov_calls_{0}, cov_nopred_{0}, cov_routed_{0}, cov_miss_{0}, cov_pred_total_{0},
         cov_pred_routed_{0}, cov_pred_miss_{0};
 };
 

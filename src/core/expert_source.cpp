@@ -1427,6 +1427,20 @@ RouterLookahead::~RouterLookahead() {
     }
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    // KURAI: the final coverage summary (always printed - the per-64 line may never fire if predictions are skipped).
+    if (cov_calls_.load() > 0 || cov_nopred_.load() > 0) {
+        const int64_t rt = cov_routed_.load(), mi = cov_miss_.load();
+        std::fprintf(stderr, "[lookahead] FINAL coverage: calls=%lld nopred=%lld routed=%lld miss=%lld pred=%lld | "
+                             "pred-in-routed=%lld (%.1f%% of routed) pred-in-miss=%lld (%.1f%% of miss) | "
+                             "thread: predicted=%lld skipped=%lld busy=%.1fms\n",
+                     (long long) cov_calls_.load(), (long long) cov_nopred_.load(), (long long) rt, (long long) mi,
+                     (long long) cov_pred_total_.load(),
+                     (long long) cov_pred_routed_.load(),
+                     rt ? 100.0 * (double) cov_pred_routed_.load() / (double) rt : 0.0,
+                     (long long) cov_pred_miss_.load(),
+                     mi ? 100.0 * (double) cov_pred_miss_.load() / (double) mi : 0.0,
+                     (long long) predicted_.load(), (long long) skipped_.load(), busy_ms());
+    }
 }
 
 bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k,
@@ -1461,10 +1475,10 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
 
 void RouterLookahead::observe(int64_t layer, const int32_t* ids, int64_t n_tok, int k, const int32_t* host_res) {
     if (ids == nullptr || n_tok <= 0 || k <= 0 || host_res == nullptr) return;
-    std::vector<int32_t> pred;
+    std::vector<int64_t> pred;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (pred_layer_ != layer) return;      // no stored prediction for this layer (the thread was busy/skipped)
+        if (pred_layer_ != layer) { cov_nopred_.fetch_add(1, std::memory_order_relaxed); return; }
         pred = pred_ids_;
     }
     int64_t routed = 0, miss = 0, pr = 0, pm = 0;
@@ -1487,12 +1501,13 @@ void RouterLookahead::observe(int64_t layer, const int32_t* ids, int64_t n_tok, 
     cov_pred_miss_.fetch_add(pm, std::memory_order_relaxed);
     cov_pred_total_.fetch_add((int64_t) pred.size(), std::memory_order_relaxed);
     const int64_t c = cov_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (c % 256 == 0) {
+    if (c % 64 == 0) {
         const int64_t rt = cov_routed_.load(), mi = cov_miss_.load();
-        std::fprintf(stderr, "[lookahead] coverage: calls=%lld routed=%lld miss=%lld pred=%lld | "
+        std::fprintf(stderr, "[lookahead] coverage: calls=%lld nopred=%lld routed=%lld miss=%lld pred=%lld | "
                              "pred-in-routed=%lld (%.1f%% of routed) pred-in-miss=%lld (%.1f%% of miss) | "
                              "thread: predicted=%lld skipped=%lld busy=%.1fms\n",
-                     (long long) c, (long long) rt, (long long) mi, (long long) cov_pred_total_.load(),
+                     (long long) c, (long long) cov_nopred_.load(), (long long) rt, (long long) mi,
+                     (long long) cov_pred_total_.load(),
                      (long long) cov_pred_routed_.load(),
                      rt ? 100.0 * (double) cov_pred_routed_.load() / (double) rt : 0.0,
                      (long long) cov_pred_miss_.load(),
