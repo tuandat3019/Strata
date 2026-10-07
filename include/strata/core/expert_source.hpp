@@ -202,6 +202,10 @@ public:
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
+    /// KURAI (foresight study, #1348): count how much of what `layer` actually routed (and missed) was in the
+    /// prediction made for it.  `ids` are n_tok x k routed experts; a miss is host_res[layer * n_expert + e] < 0.
+    /// Prints a cumulative line every 256 calls.  Counters only, not control flow.
+    void observe(int64_t layer, const int32_t* ids, int64_t n_tok, int k, const int32_t* host_res);
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
@@ -221,6 +225,11 @@ private:
     std::vector<float> x_;
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
+    // KURAI foresight coverage counters (observe()): the last stored prediction and the running tallies.
+    std::vector<int32_t> pred_ids_;   ///< the prediction stored for pred_layer_ (the last one the thread finished)
+    int64_t pred_layer_ = -1;
+    std::atomic<int64_t> cov_calls_{0}, cov_routed_{0}, cov_miss_{0}, cov_pred_total_{0},
+        cov_pred_routed_{0}, cov_pred_miss_{0};
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
