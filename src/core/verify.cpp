@@ -237,6 +237,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    if (remote_opt_) remote_opt_->release_done();   // KURAI async: the helper doorbells too, or those spins hold the GPU
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     const OnDevice on_device(device_);
@@ -322,6 +323,10 @@ void Verifier::diag(std::FILE* f) const {
     std::fprintf(f, "  verify window%s: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
                     "served %u, plan (A) %u, copies (B) %u\n", current ? "" : " (last window, not the current stage)",
                  last_t_, (long long) last_pos0_, cur_layer_ + 1, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
+    if (remote_opt_ != nullptr) {
+        const std::string hd = remote_opt_->helpers_diag();   // KURAI async: the doorbell and the helper's stream
+        if (!hd.empty()) std::fputs(hd.c_str(), f);
+    }
     trace_dump(f);   // #649: STRATA_VERIFY_TRACE=1 only
 }
 
@@ -1275,10 +1280,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+                if (remote_opt_) remote_opt_->wait_done(cs, ring);   // KURAI async: this helper's share, too
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
             } else {
                 wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
+                if (remote_opt_) remote_opt_->wait_done(cs, ring);   // KURAI async: this helper's share, too
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
@@ -1630,6 +1637,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (remote_opt_) remote_opt_->reset_done();   // KURAI async: the window's helper doorbells restart at 1
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -1746,6 +1754,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
+                std::string herr;   // KURAI async: a dead helper never posts its doorbell, so notice it here
+                if (remote_opt_ && !remote_opt_->poll_helpers(herr)) {
+                    err = herr;
+                    release_gpu_waits(5000);   // no spin kernel may outlive the engine
+                    return false;
+                }
                 const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
                     trace_ev("NEVER-RANG", k, l, (int64_t) q);
@@ -1777,9 +1791,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+        RemoteExpertOpt::set_dispatch_ring(want);   // KURAI async: the ring this dispatch's helper doorbell carries
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        else if (remote_opt_ != nullptr)
+            remote_opt_->release_done();   // KURAI async: a drained window dispatches nothing - unblock its helper waits
+        RemoteExpertOpt::set_dispatch_ring(0);
         if (remote_opt_) remote_opt_->end();
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
@@ -1814,6 +1832,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
+    if (remote_opt_) remote_opt_->flush_helpers();   // KURAI async: submit the helper stream's tail (WDDM defers)
     // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
     // spin kernel outlives the process - the case that left Windows GPUs "lost" until a power cycle.  The wait
@@ -2319,6 +2338,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (remote_opt_) remote_opt_->reset_done();   // KURAI async: the window's helper doorbells restart at 1
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
@@ -2384,6 +2404,12 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
+                std::string herr;   // KURAI async: a dead helper never posts its doorbell, so notice it here
+                if (remote_opt_ && !remote_opt_->poll_helpers(herr)) {
+                    err = herr;
+                    release_gpu_waits(5000);
+                    return false;
+                }
                 const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
                     err = "verify batch: layer " + std::to_string(l) + " never rang (" +
@@ -2400,7 +2426,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cur_layer_ = want - 1;
         set_plan_slot(0);
         progress_at("verify batch: the CPU experts of layer", l);
+        RemoteExpertOpt::set_dispatch_ring(want);   // KURAI async: the ring this dispatch's helper doorbell carries
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        else if (remote_opt_ != nullptr) remote_opt_->release_done();
+        RemoteExpertOpt::set_dispatch_ring(0);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -2533,6 +2562,13 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         if (*seq < want) {
             const auto now = Clock::now();
             if (now - b_last_ > std::chrono::milliseconds(2)) {
+                std::string herr;   // KURAI async: a dead helper never posts its doorbell, so notice it here
+                if (remote_opt_ && !remote_opt_->poll_helpers(herr)) {
+                    err = herr;
+                    release_gpu_waits(5000);
+                    b_running_ = false;
+                    return -1;
+                }
                 const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
                     err = "verify batch: layer " + std::to_string(lb_ + b_k_) + " never rang (" +
@@ -2551,7 +2587,10 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot(0);
+        RemoteExpertOpt::set_dispatch_ring(want);   // KURAI async: the ring this dispatch's helper doorbell carries
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        else if (remote_opt_ != nullptr) remote_opt_->release_done();
+        RemoteExpertOpt::set_dispatch_ring(0);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -2743,6 +2782,12 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             const double now = now_ms();
             if (now - fl_flush_ms_ > 2.0) {   // flush WDDM and notice a dead graph, as run() does
                 fl_flush_ms_ = now;
+                std::string herr;   // KURAI async: a dead helper never posts its doorbell, so notice it here
+                if (remote_opt_ && !remote_opt_->poll_helpers(herr)) {
+                    err = herr;
+                    release_gpu_waits(5000);
+                    return -1;
+                }
                 const cudaError_t q = cudaEventQuery(ev_done_);
                 if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < want) {
                     trace_ev("NEVER-RANG", fl_k_, l, (int64_t) q);
@@ -2766,9 +2811,13 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
+        RemoteExpertOpt::set_dispatch_ring(want);   // KURAI async: the ring this dispatch's helper doorbell carries
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        else if (remote_opt_ != nullptr)
+            remote_opt_->release_done();   // KURAI async: a drained window dispatches nothing - unblock its helper waits
+        RemoteExpertOpt::set_dispatch_ring(0);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
                               (int64_t) ms_since(b));
         progress_tick();

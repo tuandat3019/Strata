@@ -338,6 +338,17 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
 }
 
 bool RemoteExperts::finish(float* out, std::string& err) {
+    const bool opt_active = remote_opt_ != nullptr && remote_opt_->active();
+    // KURAI (STRATA_REMOTE_ASYNC=1, --remote-expert-opt only): finish() stops waiting for this stream here.
+    // The mask is set, the mark is posted through the copy engine (a 4-byte D2H - this device's kernels never
+    // write host memory), and the window's graph waits on that counter (RemoteExpertOpt::wait_done) before its
+    // combine reads the sums from h_out_.  Every other caller (the batch path, the prompt path, async off)
+    // keeps the blocking finish below.
+    if (remote_opt_ != nullptr && remote_opt_->async_ready() && opt_active) {
+        DeviceScope scope(device_);
+        if (!scope.ok) { err = scope.error(device_); return false; }
+        return remote_opt_->finish_async_opt(*this, err);
+    }
     if (group_id_.empty()) return true;
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
@@ -360,7 +371,12 @@ bool RemoteExperts::finish(float* out, std::string& err) {
         return false;
     }
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
-    if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
+    if (remote_opt_ && remote_opt_->active()) {
+        remote_opt_->accumulate(*this);
+        // STRATA_REMOTE_ASYNC: even on this (sync-accumulate) path the graph's done wait must be satisfied.
+        if (remote_opt_->async_enabled()) remote_opt_->mark_done_now(*this);
+        return true;
+    }
     for (size_t i = 0; i < original_row_.size(); ++i)
         std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
     return true;
