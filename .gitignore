@@ -61,3 +61,7 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# Kurai: local engine builds (huge binaries; kept out of git)
+/engine-opt2/
+/engine-async/
