@@ -65,3 +65,6 @@ build-vision-cuda12.bat
 # Kurai: local engine builds (huge binaries; kept out of git)
 /engine-opt2/
 /engine-async/
+
+# KURAI dev engine (coverage build) - never commit.
+engine-foresight/
