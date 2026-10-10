@@ -66,6 +66,7 @@ build-vision-cuda12.bat
 /engine-opt2/
 /engine-async/
 /engine-0142/
+/engine-0142r/
 /engine-foresight/
 /engine.bak-0138/
 # Kurai: local run artifacts (configs, logs, backups)
