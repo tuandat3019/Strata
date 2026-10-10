@@ -11,7 +11,15 @@
 #if defined(__HIPCC__) && defined(__has_include)
 #if __has_include(<rocwmma/rocwmma.hpp>)
 #ifndef STRATA_GDN_WY_HAVE_ROCWMMA
+// KURAI: rocwmma's config.h static-asserts on device passes for archs without WMMA
+// (gfx1030/1032 RDNA2 and older) - skip the include there; the FMA fallback stays.
+#if !defined(__HIP_DEVICE_COMPILE__) || !__HIP_DEVICE_COMPILE__ || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__)
 #define STRATA_GDN_WY_HAVE_ROCWMMA 1
+#endif
+#endif
+#endif
+#endif
+#if defined(STRATA_GDN_WY_HAVE_ROCWMMA)
 #undef __dp4a
 #undef __vsub4
 #undef __vsubss4
@@ -31,6 +39,4 @@
 #define __shfl_up_sync(...) (::strata::hip_compat::shfl_up_sync(__VA_ARGS__))
 #define __shfl_sync(...) (::strata::hip_compat::shfl_sync(__VA_ARGS__))
 #define __ballot_sync(...) (::strata::hip_compat::ballot_sync(__VA_ARGS__))
-#endif
-#endif
 #endif
