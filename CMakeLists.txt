@@ -820,6 +820,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(iq_multi_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(iq_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME iq_multi_parity COMMAND iq_multi_parity)
+  # the WY-form chunk-parallel GDN recurrence: algebra proof of the host chunked reference against the
+  # serial token loop (GPU kernel ground truth; HIP-portable - no cp.async)
+  # GPU-only: the .cu targets have no linker language on a CPU-only configure
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+    add_executable(gdn_wy_check src/prefill/gdn_wy_check.cu)
+    target_link_libraries(gdn_wy_check PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME gdn_wy_check COMMAND gdn_wy_check)
+  # the WMMA-folds WY arm (revised checkpoint 2026-10-05 9): device wmma kernel vs the fp64 oracle inside
+  # the pre-derived fp16-class bound, plus the +2.5*B negative control; SKIPs cleanly without rocwmma
+    add_executable(gdn_wy_wmma_check src/prefill/gdn_wy_wmma_check.cu)
+    target_link_libraries(gdn_wy_wmma_check PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME gdn_wy_wmma_check COMMAND gdn_wy_wmma_check)
+  endif()
   # the prompt path's DeltaNet recurrence: gdn_rec_kh_kernel against gdn_rec_cols_pipe_kernel, bitwise (GPU,
   # synthetic, no model; --bench adds timings).  NVIDIA only: cp.async and the CUDA occupancy API (not on gfx906)
   if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -1427,6 +1440,12 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_fused_iq_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
+      # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
+      add_executable(prefill_mmq_scatter_test tests/cuda/prefill_mmq_scatter_test.cpp)
+      target_link_libraries(prefill_mmq_scatter_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_mmq_scatter_test COMMAND prefill_mmq_scatter_test)
+      set_tests_properties(prefill_mmq_scatter_test PROPERTIES TIMEOUT 120)
     endif()
     if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)

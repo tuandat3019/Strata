@@ -16,6 +16,10 @@
 #include <cstdlib>
 #include <cstring>
 
+// the rocWMMA include for the GDN WY WMMA arm - at GLOBAL scope (its std:: names must not
+// resolve against the anonymous namespace below); see gdn_rec_wy_wmma_rocwmma.hpp
+#include "gdn_rec_wy_wmma_rocwmma.hpp"
+
 namespace strata::prefill {
 namespace {
 
@@ -45,7 +49,23 @@ __device__ __forceinline__ uint16_t hf(float f) { return __half_as_ushort(__floa
 // A SwiGLU product for an FP16 GEMM: saturated, so a token with a massive activation cannot turn into inf and then
 // NaN in the down projection (decode's q8_1 has room to ~8e6; FP16 ends at 65504).  A NaN stays NaN (fminf/fmaxf
 // would make it -65504 and hide where it came from); finite values below 65504 round exactly as before.
-__device__ __forceinline__ uint16_t hf_sat(float f) { return hf(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f)); }
+// STRATA_F16_RANGE=1 (set_f16_range): what reaches FP16's range on this device - the largest |value| the activation
+// images converted (hf_sat is their one funnel) and how many were beyond 65504 or NaN; W and Y are counted in gemm.cu.
+// Off, the cost is one flag read per value.  The max is kept as float bits (positive floats order as unsigned ints),
+// and a thread takes the atomic only when it beats the value it read, so the atomics stop once the max has settled.
+__device__ int g_f16_range_on = 0;
+__device__ unsigned g_f16_range_max = 0;
+__device__ unsigned long long g_f16_range_over = 0;
+__device__ __forceinline__ void f16_range_note(float f) {
+    const float a = fabsf(f);
+    const unsigned bits = __float_as_uint(a);
+    if (bits > g_f16_range_max) atomicMax(&g_f16_range_max, bits);
+    if (a > 65504.0f || isnan(f)) atomicAdd(&g_f16_range_over, 1ull);
+}
+__device__ __forceinline__ uint16_t hf_sat(float f) {
+    if (g_f16_range_on) f16_range_note(f);
+    return hf(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f));
+}
 // The prompt path's 16-bit activation image for the BF16-weight GEMMs: BF16, or FP16 where the GEMM library is fast
 // only in FP16 (prompt_f16() in gemm.cu: rocBLAS on gfx103x).  Set once per device before the first prompt.
 #if defined(__HIPCC__)   // HIP only (#835): the CUDA kernels stay exactly as they were, they never read the flag
@@ -1470,6 +1490,118 @@ __global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __res
     }
 }
 #endif   // __HIPCC__
+constexpr int WY = 64;   // the WY sub-chunk length (gdn_rec_wy_kernel)
+// The chunk-parallel (WY-form) recurrence: tokens in 64-token sub-chunks; per sub-chunk one CxC unit-lower-
+// triangular solve (the only serial part, C steps instead of C fully-serial token steps) and GEMV-shaped
+// folds.  Opt-in STRATA_GDN_WY: EXACT MODULO SUMMATION ORDER ONLY (same fp32 dtype, no tolerance - the
+// reassociation bound and the fp64-oracle check live in src/prefill/gdn_wy_check.cu; design and
+// measured verdicts in the PR description).  Writes the same pre-norm oc as the cols kernels; gdn_out_norm follows
+// unchanged.  A[t][s] = beta_t g_t (dec[t]/dec[s+1]) (k_t . k_s) with dec[t] = prod of gates before t;
+// rhs_t = beta_t (v_t - g_t dec[t] (k_t . S_in)); o_t = dec[t+1](q_t . S_in) + sum (dec[t+1]/dec[s+1])(q_t.k_s)u_s;
+// S_out = dec[w] S_in + sum (dec[w]/dec[s+1]) k_s u_s.  The two strided loops MUST stride the flat thread id
+// (rg*CB + c): under dim3(CB, RG) threadIdx.x alone covers a quarter of the range and leaves the rest of
+// kt/A uninitialized (the run-varying-NaN class gdn_wy_check's redk-vs-redq probe caught).
+__global__ void __launch_bounds__(CB * RG) gdn_rec_wy_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                             const float* __restrict__ gate,
+                                                             const float* __restrict__ beta,
+                                                             float* __restrict__ oc_out, int64_t T) {
+    __shared__ float kt[WY][S];
+    __shared__ float A[WY * WY];
+    __shared__ float dec[WY + 1];
+    __shared__ float redk[RG][CB], redq[RG][CB];
+    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
+    const int c = threadIdx.x, rg = threadIdx.y, col = cb * CB + c, tid = rg * CB + c;
+    const int qh = head % HK;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+
+    for (int64_t t0 = 0; t0 < T; t0 += WY) {
+        const int w = (int) min((int64_t) WY, T - t0);
+        if (threadIdx.x == 0) {
+            dec[0] = 1.0f;
+            for (int t = 0; t < w; ++t) dec[t + 1] = dec[t] * __expf(gate[(t0 + t) * HV + head]);
+        }
+        for (int t = 0; t < w; ++t) {
+            const float* src = h + HK * S + qh * S + (t0 + t) * C;
+            for (int i = tid; i < S; i += CB * RG) kt[t][i] = src[i];
+        }
+        __syncthreads();
+        for (int p = tid; p < WY * WY; p += CB * RG) {
+            const int t = p / WY, s2 = p % WY;
+            if (t >= w) continue;
+            if (s2 > t) { A[p] = 0.0f; continue; }
+            if (s2 == t) { A[p] = 1.0f; continue; }
+            const float b = beta[(t0 + t) * HV + head], g = __expf(gate[(t0 + t) * HV + head]);
+            float dk = 0.0f;
+#pragma unroll 4
+            for (int i = 0; i < S; ++i) dk += kt[t][i] * kt[s2][i];
+            // the decay factor as a product, not g * dec[t]/dec[s+1]: under fast decay the cumulative
+            // products underflow fp32 to 0 and the ratio becomes 0/0 = NaN (the serial path just multiplies
+            // and lands at 0).  g * (dec[t]/dec[s+1]) = prod of gates s+1..t exactly - the standalone g is
+            // consumed by the product.  Same real value, covered by the reassociation bound.
+            float dec_ratio = 1.0f;
+            for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
+            A[p] = b * dec_ratio * dk;
+        }
+        __syncthreads();
+        float uj[WY], pk[WY], pq[WY];
+        for (int t = 0; t < w; ++t) {
+            const float* qt = h + (t0 + t) * C + qh * S;
+            float kpart = 0.0f, qpart = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) { kpart += s[r] * kt[t][rg * RPG + r]; qpart += s[r] * qt[rg * RPG + r]; }
+            redk[rg][c] = kpart;
+            redq[rg][c] = qpart;
+            __syncthreads();
+            pk[t] = redk[0][c] + redk[1][c] + redk[2][c] + redk[3][c];
+            pq[t] = redq[0][c] + redq[1][c] + redq[2][c] + redq[3][c];
+            __syncthreads();   // every thread has read both reductions before the next token overwrites them
+        }
+        for (int t = 0; t < w; ++t) {
+            const float vj = h[2 * HK * S + head * S + (t0 + t) * C + col];
+            const float b = beta[(t0 + t) * HV + head], g = __expf(gate[(t0 + t) * HV + head]);
+            float acc = b * (vj - g * dec[t] * pk[t]);
+            for (int s2 = 0; s2 < t; ++s2) acc -= A[t * WY + s2] * uj[s2];
+            uj[t] = acc;
+        }
+        for (int t = 0; t < w; ++t) {
+            const float* qt = h + (t0 + t) * C + qh * S;
+            float o = dec[t + 1] * pq[t];
+            for (int s2 = 0; s2 <= t; ++s2) {
+                float dq = 0.0f;
+#pragma unroll 4
+                for (int i = 0; i < S; ++i) dq += qt[i] * kt[s2][i];
+                float dec_ratio = 1.0f;
+                for (int j = s2 + 1; j <= t; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
+                o += dec_ratio * dq * uj[s2];
+            }
+            if (rg == 0) oc_out[(t0 + t) * HV * S + head * S + col] = o * rsqrtf((float) S);
+        }
+        for (int r = 0; r < RPG; ++r) {
+            const int i = rg * RPG + r;
+            float v = dec[w] * s[r];
+            for (int s2 = 0; s2 < w; ++s2) {
+                float dec_ratio = 1.0f;
+                for (int j = s2 + 1; j < w; ++j) dec_ratio *= __expf(gate[(t0 + j) * HV + head]);
+                v += dec_ratio * kt[s2][i] * uj[s2];
+            }
+            s[r] = v;
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+}
+// The tensor-core folds variant of the WY kernel (rocWMMA 16x16x16 fp16xfp16->f32, wave32),
+// included INSIDE the anonymous namespace so it sees S/HK/HV/C/CB/RG/RPG/NCB/WY above; the
+// the pre-derived fp16-class error bound and the parity gates predate this file (PR description) QA note: the codegen draft's `sh` alias
+// was block-scoped; hoisted to kernel scope at the LDS declarations during review.
+#include "gdn_rec_wy_wmma.cuh"
+// the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
+// norm stays in its scratch buffer)
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                          float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
                                                          int64_t ld16) {
@@ -1707,7 +1839,7 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
 }
 __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
-        y[i] = hf(x[i]);
+        y[i] = hf_sat(x[i]);   // saturated and counted like every other FP16 image (the hc / embedding image on gfx103x)
 }
 __global__ void round_f16_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
@@ -1815,6 +1947,24 @@ void set_act_f16(bool on) {
         std::exit(1);
     }
 #endif
+}
+void set_f16_range(bool on) {
+    const int v = on ? 1 : 0;
+    if (cudaMemcpyToSymbol(g_f16_range_on, &v, sizeof v) != cudaSuccess) {
+        std::fprintf(stderr, "prefill: setting the FP16 range check failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        std::exit(1);
+    }
+}
+bool f16_range_read(float& max_abs, unsigned long long& over, bool reset) {
+    unsigned bits = 0; unsigned long long o = 0;
+    if (cudaMemcpyFromSymbol(&bits, g_f16_range_max, sizeof bits) != cudaSuccess ||
+        cudaMemcpyFromSymbol(&o, g_f16_range_over, sizeof o) != cudaSuccess) { cudaGetLastError(); return false; }
+    union { unsigned u; float f; } c; c.u = bits; max_abs = c.f; over = o;
+    if (reset) {
+        const unsigned z = 0; const unsigned long long zz = 0;
+        cudaMemcpyToSymbol(g_f16_range_max, &z, sizeof z); cudaMemcpyToSymbol(g_f16_range_over, &zz, sizeof zz);
+    }
+    return true;
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
@@ -1976,16 +2126,28 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
+        static const bool wy = [] { const char* v = std::getenv("STRATA_GDN_WY"); return v != nullptr && v[0] != '\0' && v[0] != '0'; }();
 #if !defined(__HIPCC__)
         // STRATA_GDN_CHUNKED=1 (opt-in): the recurrence in chunks for prompt chunks of kGdnChunkedMin+ tokens (other
         // bits; a shorter chunk, a card it does not fit or a failed scratch allocation takes the kernels below)
         static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
         if (chunked && T >= kGdnChunkedMin && gdn_rec_chunked(state, h, gate, beta, y, T, (cudaStream_t) stream) == cudaSuccess) {
-        } else if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
+        } else if (pipe && !wy && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
             gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
 #endif
-        if (pipe)   // the software-pipelined loads (same bits)
+        if (wy) {   // the chunk-parallel WY recurrence (opt-in; wmma folds per the revised checkpoint, fma fallback)
+            if (gdn_wy_wmma_supported()) {
+                static const bool said_wmma = [] { std::fprintf(stderr, "gdn wy arm = wmma (gfx1100, opt-in)\n"); return true; }();
+                (void) said_wmma;
+                gdn_rec_wy_wmma_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            } else {
+                static const bool said_fma = [] { std::fprintf(stderr, "gdn wy arm = fma (opt-in, wmma unavailable)\n"); return true; }();
+                (void) said_fma;
+                gdn_rec_wy_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            }
+        }
+        else if (pipe)   // the software-pipelined loads (same bits)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
             gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
