@@ -59,6 +59,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import kurai_gpu_guard
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -2254,6 +2255,7 @@ class Vision:
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
+            kurai_gpu_guard.require_vision_allowed()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -3088,6 +3090,10 @@ class Service:
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
+        try:
+            kurai_gpu_guard.require_load_allowed(resident=self.loaded() and not self._vision_down(), secondary=kurai_gpu_guard.secondary_state(self))
+        except RuntimeError as error:
+            raise GpuBusy(str(error)) from error
         if self.loaded() and not self._vision_down():
             return
         hook_failed = None
@@ -3505,7 +3511,7 @@ class Service:
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
         return {
-            "service": "strata", "model": self.model,
+            "service": "strata", "model": self.model, "kurai_gpu_guard": 1, "kurai_secondary_gpu": kurai_gpu_guard.secondary_state(self),
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
@@ -5207,6 +5213,11 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            try:
+                kurai_gpu_guard.guard_request(path, self.headers, self.path.partition("?")[2])
+            except (RuntimeError, OSError, ValueError) as error:
+                self._json(503, {"error": {"type": "gpu_reserved", "message": str(error)}})
+                return
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path == "/settings":
@@ -6370,6 +6381,7 @@ def check_request_sampling(req) -> None:
 
 
 def main() -> int:
+    kurai_gpu_guard.require_load_allowed()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
