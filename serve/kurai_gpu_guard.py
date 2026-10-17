@@ -8,8 +8,8 @@ import uuid
 import time
 
 request = threading.local()
-DEFAULT_LEASE = 'C:\\Projects\\kurai-llm\\skills\\kurai-3d\\gpu-lease.json'  # Installer records the checkout; KURAI_GPU_LEASE_FILE overrides it after relocation.
-DEFAULT_STOP = 'C:\\Projects\\kurai-llm\\Logs\\llm-manual-stop.json'
+DEFAULT_LEASE = 'F:\\Projects\\kurai-llm\\skills\\kurai-3d\\gpu-lease.json'  # Installer records the checkout; KURAI_GPU_LEASE_FILE overrides it after relocation.
+DEFAULT_STOP = 'F:\\Projects\\kurai-llm\\Logs\\llm-manual-stop.json'
 SECONDARY = 'kurai-film-secondary'
 INFERENCE = {'/v1/chat/completions','/v1/messages','/v1/responses','/completion','/completions'}
 _readers = {}

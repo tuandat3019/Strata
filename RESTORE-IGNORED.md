@@ -1,7 +1,7 @@
 # RESTORE-IGNORED — Strata
 
 Tài liệu khôi phục các file **không nằm trong Git** của project. Cập nhật 2026-10-17,
-trước khi chuyển `C:\Projects\strata` sang `F:\Projects\strata`.
+trước khi chuyển `F:\Projects\strata` sang `F:\Projects\strata`.
 
 ## 1. Dữ liệu ignored
 
