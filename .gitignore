@@ -36,6 +36,7 @@ td.log
 /run-*.sh
 /strata-*.json
 /strata-*.log
+/sweep-*.json
 /build-strata.bat
 /build-strata-cuda12.bat
 /build-cuda12/
@@ -48,6 +49,7 @@ build-vision-cuda12.bat
 
 # setup.py outputs (engine, downloads) and release builds
 /engine/
+/engine-*/
 /engine-cuda12/
 /build-release*/
 /dist/
