@@ -1,7 +1,7 @@
 """CPU-only regression for opt-in reasoning recovery: python -m unittest serve.test_reasoning_loop_recovery."""
 import threading
 import unittest
-from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT,
+from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT, LOW_EFFORT,
                           reasoning_repeat_coverage, focused_recovery_prompt)
 
 
@@ -50,7 +50,11 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_preserves_task_and_exact_generated_tokens(self):
         generated = self.tok.encode('中文 partially checked code', parse_special=False)
         prompt = focused_recovery_prompt(self.tok, self.ids, generated)
-        self.assertEqual(prompt[-len(generated):], generated)
+        low = self.tok.encode(LOW_EFFORT, parse_special=False)
+        self.assertEqual(prompt[:len(self.ids)], self.ids)          # the head is untouched (the cache keeps it)
+        self.assertEqual(prompt[len(self.ids):len(self.ids) + len(generated)], generated)
+        self.assertEqual(prompt[len(self.ids) + len(generated):], low)
+        self.assertIn(HIGH_EFFORT, self.tok.decode(prompt))         # the xhigh sentence stays where it was
         self.assertIn('Solve this unchanged task', self.tok.decode(prompt))
         self.assertNotIn('</think>', self.tok.decode(prompt))
 
@@ -103,8 +107,8 @@ class ReasoningLoopRecovery(unittest.TestCase):
         marked = self.tok.encode(head + '<|im_end|>\n<|im_start|>user\nquote ' + THINK_TAGS['</think>'] +
                                  ' please<|im_end|>\n<|im_start|>assistant\n<think>\n', parse_special=True)
         spliced = focused_recovery_prompt(self.tok, marked, [])
-        tail = marked[len(self.tok.encode(head, parse_special=True)):]
-        self.assertEqual(spliced[-len(tail):], tail)             # everything after the sentence is the same ids
+        self.assertEqual(spliced[:len(marked)], marked)          # every id the prompt had, in place
+        self.assertEqual(spliced[len(marked):], self.tok.encode(LOW_EFFORT, parse_special=False))
         self.assertNotEqual(spliced, marked)
 
     def test_stop_mode_ends_the_reply_at_the_loop(self):
@@ -202,10 +206,11 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(events[-1][1]['finish'], 'stop')
         content = ''.join(e.text or '' for kind, e in events if kind == 'event' and e.kind == 'content')
         self.assertEqual(content, 'Complete solution.')
-        head_size = len(focused_recovery_prompt(self.tok, self.ids, []))
-        retained = engine.calls[1][0][head_size:]
+        low = self.tok.encode(LOW_EFFORT, parse_special=False)
+        retained = engine.calls[1][0][len(self.ids):-len(low)]
         self.assertEqual(retained, self.tok.encode(self.loop)[:len(retained)])
-        self.assertEqual(engine.calls[1][1], 40000 - len(retained))
+        self.assertEqual(engine.calls[1][1], 40000 - len(retained) - len(low))
+        self.assertEqual(engine.calls[1][0][len(self.ids) + len(retained):], low)
         self.assertNotIn('</think>', self.tok.decode(engine.calls[1][0]))
 
 

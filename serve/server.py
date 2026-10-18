@@ -152,7 +152,10 @@ REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
-# low-effort instruction in place of the xhigh one.  Both off by default.
+# low-effort instruction appended to it and written into the stream (Kurai 18/10/2026: swapping the xhigh sentence
+# of the first system message changed the prompt's first tokens, so no checkpoint matched the state the engine
+# held - every recovery read ~14k tokens back and the next request read its whole prompt again).  Both off by
+# default.
 HIGH_EFFORT = EFFORT_TEXT["xhigh"]
 LOW_EFFORT = EFFORT_TEXT["low"]
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
@@ -190,21 +193,24 @@ def reasoning_repeat_coverage(text):
 
 
 def focused_recovery_prompt(tok, ids, generated):
-    """The prompt's ids with the xhigh effort sentence of the first system message replaced by the low one, then
-    every token generated so far.  A splice of token ids: the prompt is never decoded and encoded again, so a literal
-    `</think>` or vision marker in it (#537, #554) stays what it was.  None when the sentence is not there as whole
-    tokens in the first system message (a user's text never counts).  No answer or end-of-thinking is inserted."""
+    """The prompt's ids, then every token generated so far, then the low-effort instruction.  The xhigh sentence is
+    left where the template put it (Kurai 19/10/2026): replacing it changed the prompt's very first tokens, so the
+    conversation cache could not match the state the engine already held - a recovery read ~14k tokens back and the
+    next request read its whole prompt again (2-4 minutes).  Appended, the engine resumes from the state it holds
+    and the next request's prompt matches the stream the client saw, because the caller writes the instruction into
+    that stream.  A splice of token ids: the prompt is never decoded and encoded again, so a literal `</think>` or
+    vision marker in it (#537, #554) stays what it was.  None when the sentence is not there as whole tokens in the
+    first system message (a user's text never counts).  No answer or end-of-thinking is inserted."""
     end = tok.encode(IM_END, parse_special=True)
     if len(end) != 1 or end[0] not in ids:
         return None
     head = ids[:ids.index(end[0])]
     if not tok.decode(head).startswith("<|im_start|>system\n"):
         return None
-    old, new = tok.encode(HIGH_EFFORT, parse_special=False), tok.encode(LOW_EFFORT, parse_special=False)
-    for i in range(len(head) - len(old) + 1):
-        if head[i:i + len(old)] == old:
-            return ids[:i] + new + ids[i + len(old):] + list(generated)
-    return None
+    old = tok.encode(HIGH_EFFORT, parse_special=False)
+    if not any(head[i:i + len(old)] == old for i in range(len(head) - len(old) + 1)):
+        return None
+    return list(ids) + list(generated) + tok.encode(LOW_EFFORT, parse_special=False)
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
@@ -4150,25 +4156,40 @@ class Service:
                             finish = "length"
                             break
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
-                            recovery_count += 1
-                            # Only the two settings that keep the same words coming are raised (temperature to at
-                            # least 1.0, presence penalty to at least 1.5): a client's top_p and top_k are never
-                            # touched, and its own request dict is copied, not changed.
-                            want = (max(1.0, float((sampling or {}).get("temperature") or 0)),
-                                    max(1.5, float((sampling or {}).get("presence_penalty") or 0)))
-                            if want != tuple(float((sampling or {}).get(k) or 0)
-                                             for k in ("temperature", "presence_penalty")):
-                                sampling = {**(sampling or {}), "temperature": want[0], "presence_penalty": want[1]}
-                            prompt = recover_prompt
-                            with self.status_lock:
-                                st["reasoning_recoveries"] = recovery_count
-                            if trace is not None:
-                                trace["reasoning_recoveries"] = recovery_count
-                                trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
-                            print(f"[strata] repeated reasoning detected at {n} tokens "
-                                  f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
-                                  "instruction (reasoning_loop_recovery)", flush=True)
-                            continue
+                            extra = self.tok.encode(LOW_EFFORT, parse_special=False)
+                            # Kurai 19/10/2026: the instruction goes into the stream the way the budget's wrap-up
+                            # and the close retry above do, so the prompt grows by exactly the bytes the client
+                            # saw.  Kept out of the stream it made the engine's conversation and the next request's
+                            # prompt diverge mid-reasoning: no checkpoint matched and every request read its whole
+                            # prompt again (2-4 minutes each).
+                            if max_new - n - len(extra) >= 1:
+                                recovery_count += 1
+                                # Only the two settings that keep the same words coming are raised (temperature to
+                                # at least 1.0, presence penalty to at least 1.5): a client's top_p and top_k are
+                                # never touched, and its own request dict is copied, not changed.
+                                want = (max(1.0, float((sampling or {}).get("temperature") or 0)),
+                                        max(1.5, float((sampling or {}).get("presence_penalty") or 0)))
+                                if want != tuple(float((sampling or {}).get(k) or 0)
+                                                 for k in ("temperature", "presence_penalty")):
+                                    sampling = {**(sampling or {}), "temperature": want[0], "presence_penalty": want[1]}
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                    thinking_n += parser.state in ("reasoning", "rcall")
+                                    evs = cut(parser.feed(detok.push(t)))
+                                    self._note(n, evs, st, rate)
+                                    for ev in evs:
+                                        yield "event", ev
+                                prompt = recover_prompt
+                                with self.status_lock:
+                                    st["reasoning_recoveries"] = recovery_count
+                                if trace is not None:
+                                    trace["reasoning_recoveries"] = recovery_count
+                                    trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
+                                print(f"[strata] repeated reasoning detected at {n} tokens "
+                                      f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
+                                      "instruction (reasoning_loop_recovery)", flush=True)
+                                continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != THINK_END         # #537: not after a held </think>, the end
